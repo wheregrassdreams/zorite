@@ -19,12 +19,14 @@ use crate::theme;
 use rust_i18n::t;
 
 pub fn render(app: &AppView, day_min: Pixels, cx: &mut Context<AppView>) -> impl IntoElement {
-    // Reader-day windowing: a MarkdownView rebuilds its whole element tree
-    // every frame, so days far outside the viewport render as fixed-height
-    // spacers instead (their bounds come from `feed_items`, tracked last
-    // frame — spacers keep occupying the same geometry, so the bounds stay
-    // fresh). WYSIWYG days are one cached editor element each and stay cheap;
-    // the feed find needs every day's blocks painted — both render fully.
+    // Day windowing: a day far outside the viewport renders as a fixed-height
+    // spacer instead of its content (its bounds come from `feed_items`,
+    // tracked last frame — spacers keep occupying the same geometry, so the
+    // bounds stay fresh). This covers the WYSIWYG feed too: every loaded day
+    // holds an editor that shapes and paints its whole document each frame, so
+    // leaving them all mounted made the feed slower the further you scrolled
+    // (up to FEED_MAX_DAYS editors alive at once). The feed find still needs
+    // every day painted, so it opts out.
     let viewport = app.feed_scroll.bounds();
     if app.feed_heights_width.get() != viewport.size.width {
         app.feed_day_heights.borrow_mut().clear();
@@ -51,7 +53,7 @@ pub fn render(app: &AppView, day_min: Pixels, cx: &mut Context<AppView>) -> impl
         }
     }
     let margin = viewport.size.height.max(px(400.));
-    let windowable = !app.wysiwyg() && app.feed_find.is_none() && viewport.size.height > px(0.);
+    let windowable = app.feed_find.is_none() && viewport.size.height > px(0.);
     let mut spacers = std::collections::HashSet::new();
     let mut sections = Vec::new();
     for (pos, (i, date)) in days.iter().enumerate() {

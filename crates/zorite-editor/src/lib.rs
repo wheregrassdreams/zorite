@@ -1788,6 +1788,7 @@ impl EditorState {
             math: markdown_syntax::math_regions(&self.content),
             props: markdown_syntax::property_regions(&self.content),
             alert_folds: markdown_syntax::alert_fold_regions(&self.content),
+            comments: zorite_markdown::syntax::comment_regions(&self.content),
             fence_odd,
         });
         *self.scan_cache.borrow_mut() = Some((self.content_gen, data.clone()));
@@ -2323,14 +2324,10 @@ impl EditorState {
                 && row > 0
                 && self.property_block_at(row).is_none()
                 && self.property_block_at(row - 1).is_some();
-            // Cditor-style around hidden formatting markers: delete the
-            // previous VISIBLE character (never a marker byte), and take an
-            // emptied construct's marker pair with it.
-            if let Some(range) = self.fmt_delete_range(off, true) {
-                self.replace_range(range, "", cx);
-                cx.emit(EditorEvent::Changed);
-                return;
-            }
+            // Deletion is raw: the preview only decides what is painted, never
+            // which bytes Backspace takes. A marker the caret can reach is one
+            // the reveal already shows (see `construct_at`), so there is no
+            // invisible byte to skip over.
             let prev = self.previous_boundary(off);
             if off == prev {
                 return;
@@ -2385,12 +2382,7 @@ impl EditorState {
             let join_into_props = off == self.line_end(row)
                 && self.property_block_at(row).is_none()
                 && self.property_block_at(row + 1).is_some();
-            // Cditor-style around hidden formatting markers (see backspace).
-            if let Some(range) = self.fmt_delete_range(off, false) {
-                self.replace_range(range, "", cx);
-                cx.emit(EditorEvent::Changed);
-                return;
-            }
+            // Deletion is raw here too (see backspace).
             let next = self.next_boundary(off);
             if off == next {
                 return;
@@ -5131,69 +5123,6 @@ impl EditorState {
         }
     }
 
-    /// Cditor-style deletion planning around hidden formatting markers: the
-    /// range a backspace (`back`) / forward delete should remove at `off`.
-    /// Skips the invisible marker bytes to the adjacent VISIBLE character —
-    /// and when removing it would empty its construct, the now-empty marker
-    /// pair goes too (deleting bold's last char deletes the bold). `None` =
-    /// no hidden markers involved (the plain grapheme deletion applies).
-    fn fmt_delete_range(&self, off: usize, back: bool) -> Option<Range<usize>> {
-        let st = self.markdown_style.as_ref()?;
-        let (row, col) = self.row_col(off);
-        let line_start = self.line_starts()[row];
-        let line_end = self.line_end(row);
-        let line = &self.content[line_start..line_end];
-        // Inside a fenced code block the text is verbatim — no markers there.
-        if *self.scan_data().fence_odd.get(row).unwrap_or(&false)
-            || line.trim_start().starts_with("```")
-        {
-            return None;
-        }
-        let pairs = markdown_syntax::fmt_marker_pairs(line, st);
-        if pairs.is_empty() {
-            return None;
-        }
-        let markers: Vec<&Range<usize>> = pairs.iter().flat_map(|(o, c)| [o, c]).collect();
-        // Skip marker bytes in the deletion direction to the visible char.
-        let mut edge = col;
-        if back {
-            while let Some(sp) = markers.iter().find(|sp| sp.end == edge) {
-                edge = sp.start;
-            }
-        } else {
-            while let Some(sp) = markers.iter().find(|sp| sp.start == edge) {
-                edge = sp.end;
-            }
-        }
-        // The visible grapheme adjacent to the (possibly skipped-to) edge —
-        // staying on this line; a line join takes the default path.
-        let (del_start, del_end) = if back {
-            if edge == 0 {
-                return None;
-            }
-            let p = self.previous_boundary(line_start + edge) - line_start;
-            (p, edge)
-        } else {
-            if edge >= line.len() {
-                return None;
-            }
-            let n = self.next_boundary(line_start + edge).min(line_end) - line_start;
-            (edge, n)
-        };
-        // Would this empty a construct? Only a real PAIR collapses: ITS opener
-        // ending at the deletion's start and ITS closer starting at the end
-        // (adjacent different constructs must not fuse).
-        let emptied = pairs
-            .iter()
-            .find(|(o, c)| o.end == del_start && c.start == del_end);
-        let range = match emptied {
-            Some((o, c)) => o.start..c.end,
-            None if edge == col => return None, // no markers were involved
-            None => del_start..del_end,
-        };
-        Some(line_start + range.start..line_start + range.end)
-    }
-
     fn previous_boundary(&self, offset: usize) -> usize {
         self.content
             .grapheme_indices(true)
@@ -7021,6 +6950,9 @@ pub(crate) struct ScanData {
     math: Vec<markdown_syntax::MathRegion>,
     props: Vec<Range<usize>>,
     alert_folds: Vec<(Range<usize>, bool)>,
+    /// `%%…%%` comments, in document byte offsets — hidden by every styled
+    /// line, but kept in the buffer (see `syntax::comment_regions`).
+    comments: Vec<Range<usize>>,
     /// Whether each line STARTS inside a fenced code block (odd count of ```
     /// fences above it).
     fence_odd: Vec<bool>,

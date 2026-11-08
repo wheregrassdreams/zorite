@@ -2912,6 +2912,10 @@ fn shape_document(
     } else {
         Vec::new()
     };
+    // `%%…%%` comments, in document offsets: hidden on every line they cover
+    // (an inline one stays on its line, a block one spans several), while the
+    // bytes stay in the buffer.
+    let comments: &[Range<usize>] = if md.is_some() { &scan.comments } else { &[] };
     // Collapsed heading sections fold the same way: the heading line stays
     // (its chevron paints there), the section's lines go to height 0, and the
     // caret STRICTLY INSIDE THE BODY reveals — the fold state itself is
@@ -3722,6 +3726,12 @@ fn shape_document(
             let (disp, runs, m) = match cached {
                 Some(v) => v,
                 None => {
+                    let comment = comments
+                        .iter()
+                        .find(|r| r.start < line_end && r.end > line_start)
+                        .map(|r| {
+                            r.start.max(line_start) - line_start..r.end.min(line_end) - line_start
+                        });
                     let (disp, runs, m) = markdown_syntax::hidden_runs(
                         line,
                         base_font,
@@ -3731,6 +3741,7 @@ fn shape_document(
                         reveal_prefix,
                         hide_prefix,
                         reveal_inline,
+                        comment,
                         st,
                     );
                     let v = (

@@ -1990,6 +1990,9 @@ struct Inline {
     marks: Vec<usize>,
     mark_on: bool,
     mark_bg: Hsla,
+    /// This paragraph's `%%…%%` comments, in source offsets — hidden from the
+    /// rendered text, but still in the file (see [`comment_marks`]).
+    comments: Vec<Range<usize>>,
 }
 
 impl Inline {
@@ -2003,6 +2006,7 @@ fn inline_element(nodes: &[mdast::Node], ctx: &mut Ctx) -> AnyElement {
     let mut inl = Inline {
         mark_bg: ctx.style.mark_bg,
         marks: highlight_marks(nodes, &ctx.source),
+        comments: comment_marks(nodes, &ctx.source),
         ..Default::default()
     };
     // A checked task's text renders struck through + muted (Notion-style).
@@ -2494,6 +2498,16 @@ fn push_text(
     let mut plain_start = 0;
     let mut i = 0;
     while i < value.len() {
+        // `%%…%%` comment: hidden, markers and body alike (see `comment_marks`).
+        // Tested on source offsets because a comment can open in an earlier
+        // inline node and close in a later one.
+        if let Some(c) = crate::syntax::in_comment(&out.comments, src_base + i) {
+            out.map(src_base + plain_start);
+            push_run(&value[plain_start..i], marked(cur, out), out);
+            i = (c.end - src_base).min(value.len()).max(i + 1);
+            plain_start = i;
+            continue;
+        }
         // `==` highlight marker (validated per paragraph by `highlight_marks`):
         // hidden, toggling the highlight tint for the text that follows.
         if bytes[i] == b'=' && out.marks.contains(&(src_base + i)) {
@@ -2653,6 +2667,27 @@ fn highlight_marks(nodes: &[mdast::Node], source: &str) -> Vec<usize> {
         Some(s) => crate::syntax::highlight_markers(s)
             .into_iter()
             .map(|m| m + start)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The `%%…%%` comments a paragraph's inline nodes span, in source offsets —
+/// scanned on the same SOURCE slice [`highlight_marks`] uses, so a comment may
+/// wrap constructs the parser split into sibling nodes. `push_text` hides
+/// every byte inside one.
+fn comment_marks(nodes: &[mdast::Node], source: &str) -> Vec<Range<usize>> {
+    let (Some(first), Some(last)) = (
+        nodes.first().and_then(|n| n.position()),
+        nodes.last().and_then(|n| n.position()),
+    ) else {
+        return Vec::new();
+    };
+    let start = first.start.offset;
+    match source.get(start..last.end.offset) {
+        Some(s) => crate::syntax::comment_regions(s)
+            .into_iter()
+            .map(|r| r.start + start..r.end + start)
             .collect(),
         None => Vec::new(),
     }
@@ -3739,6 +3774,22 @@ mod search_tests {
     }
 
     #[test]
+    fn comments_are_hidden_in_the_rendered_text() {
+        // Markers and body alike, leaving the space on either side.
+        assert_eq!(first_paragraph_inline("a %%secret%% b").text, "a  b");
+        // A comment wraps constructs the parser split into sibling nodes.
+        let wrapped = first_paragraph_inline("x %%**y**%% z");
+        assert_eq!(wrapped.text, "x  z");
+        // Nothing inside a comment is a link or a tag.
+        let inside = first_paragraph_inline("%%[[Page]] #tag%%");
+        assert!(inside.links.is_empty());
+        // A block comment hides every line it spans, and the text after it stays.
+        let block = first_paragraph_inline("%%\nhidden\n%%\nshown");
+        assert!(!block.text.contains("hidden"));
+        assert!(block.text.contains("shown"));
+    }
+
+    #[test]
     fn match_count_searches_visible_text_not_markup() {
         // Markup is stripped: the word is found, the syntax isn't.
         assert_eq!(match_count("**bold** and _italic_", "bold"), 1);
@@ -3783,6 +3834,7 @@ mod search_tests {
         let mut inl = Inline {
             mark_bg: style.mark_bg,
             marks: highlight_marks(&p.children, source),
+            comments: comment_marks(&p.children, source),
             ..Default::default()
         };
         build_inline(

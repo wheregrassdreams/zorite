@@ -1104,6 +1104,66 @@ pub fn highlight_markers(line: &str) -> Vec<usize> {
     out
 }
 
+// --- Comments -------------------------------------------------------------
+//
+// `%%…%%` is Obsidian's comment. Both views hide it, but — unlike an HTML
+// comment — the bytes stay in the file, so a file opened and saved here never
+// loses one. Unclosed, it runs to the end of the source, the way Obsidian
+// reads a `%%` that is opened and never closed.
+
+/// Byte ranges of every `%%…%%` comment in `source`, markers included, in
+/// order. A `%%` inside fenced code or an inline code span is literal, as is
+/// a backslash-escaped `\%`. An unclosed opener comments to the end of
+/// `source`.
+pub fn comment_regions(source: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    // Start of the open comment, once a `%%` has been seen.
+    let mut open: Option<usize> = None;
+    let mut in_fence = false;
+    let mut line_start = 0usize;
+
+    for line in source.split('\n') {
+        let line_end = line_start + line.len();
+        let trimmed = line.trim_start();
+        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if fence {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            let b = line.as_bytes();
+            let mut i = 0;
+            while i < line.len() {
+                match b[i] {
+                    b'\\' => i += 1 + line[i + 1..].chars().next().map_or(0, char::len_utf8),
+                    b'`' => match line[i + 1..].find('`') {
+                        Some(rel) => i += rel + 2,
+                        None => break,
+                    },
+                    b'%' if b.get(i + 1) == Some(&b'%') => {
+                        match open.take() {
+                            Some(start) => out.push(start..line_start + i + 2),
+                            None => open = Some(line_start + i),
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        line_start = line_end + 1;
+    }
+    if let Some(start) = open {
+        out.push(start..source.len());
+    }
+    out
+}
+
+/// The comment range holding byte `at`, if any — what a renderer tests before
+/// showing a character. `ranges` must be the sorted output of
+/// [`comment_regions`].
+pub fn in_comment(ranges: &[std::ops::Range<usize>], at: usize) -> Option<std::ops::Range<usize>> {
+    ranges.iter().find(|r| r.start <= at && at < r.end).cloned()
+}
+
 /// Which inline-HTML tag a [`StyledTag`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StyledKind {
@@ -1283,6 +1343,26 @@ mod tests {
         assert_eq!(highlight_markers("==one== and ==two=="), vec![0, 5, 12, 17]);
         assert_eq!(highlight_close("a ==b== c", 2), Some(5));
         assert_eq!(highlight_close("a ==b=== c", 2), None);
+    }
+
+    #[test]
+    fn comments_pair_across_lines_and_skip_code() {
+        // Inline: markers included, the body between them.
+        assert_eq!(comment_regions("a %%b%% c"), vec![2..7]);
+        assert_eq!(comment_regions("%%one%% and %%two%%"), vec![0..7, 12..19]);
+        // Unclosed: to the end of the source, including a block that spans lines.
+        assert_eq!(comment_regions("a %% open"), vec![2..9]);
+        assert_eq!(comment_regions("%%\nx\n%% tail"), vec![0..7]);
+        assert_eq!(comment_regions("%%\nx\n%%").len(), 1);
+        // Code keeps its `%%` literal, inline and fenced.
+        assert!(comment_regions("`%%x%%`").is_empty());
+        assert!(comment_regions("```\n%%x%%\n```").is_empty());
+        // An escaped percent is literal.
+        assert!(comment_regions(r"a \%\% b").is_empty());
+        // A `%%` on its own line is a comment line, not an empty pair.
+        assert_eq!(comment_regions("%%"), vec![0..2]);
+        assert_eq!(in_comment(&comment_regions("a %%b%% c"), 4), Some(2..7));
+        assert_eq!(in_comment(&comment_regions("a %%b%% c"), 7), None);
     }
 
     #[test]

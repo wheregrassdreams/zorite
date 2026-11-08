@@ -125,16 +125,12 @@ struct Style {
     /// A syntax marker (`**`, `#`, `[`, …) — dimmed when shown, and removed
     /// entirely when the line's markers are hidden (W6, reveal-on-caret).
     hide: bool,
-    /// A formatting marker (`**`, `*`, `~~`, `` ` ``, `<mark>`, `<u>`) stays
-    /// hidden even with the caret inside its construct — Cditor-style: the
-    /// styling IS the feedback, and the toggles (⌘B/I/U/…, the selection
-    /// format bar) edit it. Structural markers (links, headings, math) keep
-    /// the reveal, since their raw text is the only way to edit them.
-    always_hide: bool,
-    /// Non-zero on a formatting marker: the opener and closer of one construct
-    /// share an id, so `fmt_marker_pairs` can pair them even with NESTED
-    /// constructs between (adjacency no longer identifies the pair).
-    pair_id: u16,
+    /// A formatting marker (`**`, `*`, `~~`, `` ` ``, `<mark>`, `<u>`) does not
+    /// pop out just because a SELECTION touches its line — only the caret's own
+    /// construct reveals it (see `construct_at`). Structural markers (links,
+    /// headings, math) reveal on a selection too, since their raw text is the
+    /// only way to edit them.
+    hide_in_selection: bool,
     /// What a hidden marker paints in its place (e.g. a block link's `#^`
     /// shows ` → `): every replacement byte maps back to the span's start, so
     /// the display↔source maps stay consistent. `None` = plain removal.
@@ -276,6 +272,12 @@ fn run_for(
 /// containing source byte `c`, or an empty range when `c` is in plain text.
 /// `spans` must be sorted by `range.start` and non-overlapping. Used to reveal
 /// only the construct the caret sits in (#5).
+///
+/// Both ends are INCLUSIVE, the way Obsidian's live preview reads: a caret at a
+/// construct's edge (`**bold**|`) already belongs to it, so its markers are on
+/// screen there. The preview is a view — the buffer and its editing semantics
+/// stay raw, so revealing at the boundary is what makes Backspace delete the
+/// `*` the user can see rather than a character the preview hid.
 fn construct_at(spans: &[Span], c: usize) -> Range<usize> {
     let mut i = 0;
     while i < spans.len() {
@@ -318,9 +320,26 @@ pub(crate) fn hidden_runs(
     // highlighted glyphs must be the copied bytes) while the prefix stays
     // hidden behind its painted mark.
     reveal_inline: bool,
+    // This line's `%%…%%` comment, in line-relative bytes (may open on an
+    // earlier line and close on a later one) — hidden whole.
+    comment: Option<Range<usize>>,
     md: &SyntaxStyle,
 ) -> (String, Vec<TextRun>, Vec<usize>) {
     let mut spans = scan(line, md);
+    if let Some(c) = comment {
+        // A comment is hidden markers-and-body: drop every span it touches and
+        // cover the range with one hidden span, so the reveal-on-caret path
+        // below still shows the raw text when the caret lands inside it.
+        spans.retain(|s| s.range.end <= c.start || s.range.start >= c.end);
+        spans.push(Span {
+            range: c,
+            style: Style {
+                hide: true,
+                color: Some(md.marker),
+                ..Default::default()
+            },
+        });
+    }
     spans.sort_by_key(|s| s.range.start);
 
     // The construct (a maximal run of adjacent spans: its markers + body) the
@@ -341,12 +360,15 @@ pub(crate) fn hidden_runs(
         }
         // A marker is shown when it's inside the caret's construct OR within the
         // revealed line-level prefix (e.g. a blockquote's `>` while the caret is
-        // anywhere on the line).
+        // anywhere on the line). Sitting in the construct wins over
+        // `hide_in_selection`: that flag only keeps formatting markers from
+        // popping out for a SELECTION — Obsidian reveals `**` as soon as the
+        // caret touches the construct.
         let in_construct = reveal.start <= span.range.start && span.range.end <= reveal.end;
         let in_prefix = span.range.end <= reveal_prefix;
         let force = span.range.end <= hide_prefix;
-        let hidden = span.style.hide
-            && (span.style.always_hide || force || (!reveal_inline && !in_construct && !in_prefix));
+        let shown = in_construct || in_prefix || (reveal_inline && !span.style.hide_in_selection);
+        let hidden = span.style.hide && (force || !shown);
         if !hidden {
             segs.push((span.range.clone(), Some(&span.style), None));
         } else if let Some(rep) = span.style.replace.clone() {
@@ -431,34 +453,6 @@ fn scan(text: &str, st: &SyntaxStyle) -> Vec<Span> {
     out
 }
 
-/// The always-hidden formatting-marker PAIRS on a line, as
-/// `(opening range, closing range)` per construct — for the editor's
-/// Cditor-style delete (skip the invisible bytes; collapse an emptied pair).
-pub(crate) fn fmt_marker_pairs(line: &str, st: &SyntaxStyle) -> Vec<(Range<usize>, Range<usize>)> {
-    let mut spans = scan(line, st);
-    spans.sort_by_key(|s| s.range.start);
-    // The scanner stamps each construct's opener + closer with a shared
-    // `pair_id`, so pairing survives NESTED constructs between them (the old
-    // adjacency walk assumed at most one body span).
-    let mut open: Vec<(u16, Range<usize>)> = Vec::new();
-    let mut pairs = Vec::new();
-    for sp in spans.into_iter().filter(|s| s.style.always_hide) {
-        let id = sp.style.pair_id;
-        if id == 0 {
-            continue;
-        }
-        match open.iter().position(|(oid, _)| *oid == id) {
-            Some(k) => {
-                let (_, o) = open.remove(k);
-                pairs.push((o, sp.range));
-            }
-            None => open.push((id, sp.range)),
-        }
-    }
-    pairs.sort_by_key(|(o, _)| o.start);
-    pairs
-}
-
 fn marker(out: &mut Vec<Span>, range: Range<usize>, color: Hsla) {
     out.push(Span {
         range,
@@ -470,25 +464,23 @@ fn marker(out: &mut Vec<Span>, range: Range<usize>, color: Hsla) {
     });
 }
 
-/// A formatting marker that NEVER reveals (not even with the caret inside its
-/// construct) — see [`Style::always_hide`]. The construct's opener and closer
-/// share `pair_id` (see [`fmt_marker_pairs`]).
-/// `0xRRGGBBAA` (from `syntax::css_color`) as a gpui color.
-fn hsla_of(rgba: u32) -> Hsla {
-    gpui::rgba(rgba).into()
-}
-
-fn fmt_marker(out: &mut Vec<Span>, range: Range<usize>, color: Hsla, pair_id: u16) {
+/// A formatting marker: hidden at rest, revealed with the rest of its construct
+/// while the caret is in it (see [`Style::hide_in_selection`]).
+fn fmt_marker(out: &mut Vec<Span>, range: Range<usize>, color: Hsla) {
     out.push(Span {
         range,
         style: Style {
             color: Some(color),
             hide: true,
-            always_hide: true,
-            pair_id,
+            hide_in_selection: true,
             ..Default::default()
         },
     });
+}
+
+/// `0xRRGGBBAA` (from `syntax::css_color`) as a gpui color.
+fn hsla_of(rgba: u32) -> Hsla {
+    gpui::rgba(rgba).into()
 }
 
 /// Recursively scan a formatting construct's body: inner constructs nest
@@ -504,7 +496,6 @@ fn scan_styled_body(
     out: &mut Vec<Span>,
     style: Style,
     depth: u8,
-    next_id: &mut u16,
 ) {
     if s >= e {
         return;
@@ -514,7 +505,7 @@ fn scan_styled_body(
         return;
     }
     let before = out.len();
-    scan_inline(text, s, e, st, out, &style, depth + 1, next_id);
+    scan_inline(text, s, e, st, out, &style, depth + 1);
     // Fill the gaps between the inner constructs with the body style.
     let mut covered: Vec<Range<usize>> = out[before..].iter().map(|sp| sp.range.clone()).collect();
     covered.sort_by_key(|r| r.start);
@@ -636,8 +627,7 @@ fn scan_line(text: &str, start: usize, end: usize, st: &SyntaxStyle, out: &mut V
             return;
         }
     }
-    let mut next_id = 1u16;
-    scan_inline(text, i, end, st, out, &Style::default(), 0, &mut next_id);
+    scan_inline(text, i, end, st, out, &Style::default(), 0);
 }
 
 /// The inline scanning loop, recursive so formatting constructs NEST: a
@@ -654,7 +644,6 @@ fn scan_inline(
     out: &mut Vec<Span>,
     base: &Style,
     depth: u8,
-    next_id: &mut u16,
 ) {
     let b = text.as_bytes();
     let mut i = start;
@@ -702,9 +691,7 @@ fn scan_inline(
                 }
             }
             if let Some(close) = close {
-                let id = *next_id;
-                *next_id += 1;
-                fmt_marker(out, i..i + n, st.marker, id);
+                fmt_marker(out, i..i + n, st.marker);
                 push(
                     out,
                     i + n..close,
@@ -715,7 +702,7 @@ fn scan_inline(
                     }
                     .over(base),
                 );
-                fmt_marker(out, close..close + n, st.marker, id);
+                fmt_marker(out, close..close + n, st.marker);
                 i = close + n;
                 continue;
             }
@@ -733,9 +720,7 @@ fn scan_inline(
             && b[i + 1] == b'*'
             && let Some(close) = find2_unescaped(b, i + 2, end, b'*', b'*')
         {
-            let id = *next_id;
-            *next_id += 1;
-            fmt_marker(out, i..i + 2, st.marker, id);
+            fmt_marker(out, i..i + 2, st.marker);
             scan_styled_body(
                 text,
                 i + 2,
@@ -748,9 +733,8 @@ fn scan_inline(
                 }
                 .over(base),
                 depth,
-                next_id,
             );
-            fmt_marker(out, close..close + 2, st.marker, id);
+            fmt_marker(out, close..close + 2, st.marker);
             i = close + 2;
             continue;
         }
@@ -760,9 +744,7 @@ fn scan_inline(
             && let Some(close) = find1_unescaped(b, i + 1, end, b'*')
             && close > i + 1
         {
-            let id = *next_id;
-            *next_id += 1;
-            fmt_marker(out, i..i + 1, st.marker, id);
+            fmt_marker(out, i..i + 1, st.marker);
             scan_styled_body(
                 text,
                 i + 1,
@@ -775,9 +757,8 @@ fn scan_inline(
                 }
                 .over(base),
                 depth,
-                next_id,
             );
-            fmt_marker(out, close..close + 1, st.marker, id);
+            fmt_marker(out, close..close + 1, st.marker);
             i = close + 1;
             continue;
         }
@@ -795,9 +776,7 @@ fn scan_inline(
                 && b[i + 2] != b' '
                 && let Some(close) = find_underscore_close(b, i + 2, end, true)
             {
-                let id = *next_id;
-                *next_id += 1;
-                fmt_marker(out, i..i + 2, st.marker, id);
+                fmt_marker(out, i..i + 2, st.marker);
                 scan_styled_body(
                     text,
                     i + 2,
@@ -810,9 +789,8 @@ fn scan_inline(
                     }
                     .over(base),
                     depth,
-                    next_id,
                 );
-                fmt_marker(out, close..close + 2, st.marker, id);
+                fmt_marker(out, close..close + 2, st.marker);
                 i = close + 2;
                 continue;
             }
@@ -821,9 +799,7 @@ fn scan_inline(
                 && b[i + 1] != b' '
                 && let Some(close) = find_underscore_close(b, i + 1, end, false)
             {
-                let id = *next_id;
-                *next_id += 1;
-                fmt_marker(out, i..i + 1, st.marker, id);
+                fmt_marker(out, i..i + 1, st.marker);
                 scan_styled_body(
                     text,
                     i + 1,
@@ -836,9 +812,8 @@ fn scan_inline(
                     }
                     .over(base),
                     depth,
-                    next_id,
                 );
-                fmt_marker(out, close..close + 1, st.marker, id);
+                fmt_marker(out, close..close + 1, st.marker);
                 i = close + 1;
                 continue;
             }
@@ -851,9 +826,7 @@ fn scan_inline(
             && b[i + 1] == b'='
             && let Some(close) = zorite_markdown::syntax::highlight_close(&text[..end], i)
         {
-            let id = *next_id;
-            *next_id += 1;
-            fmt_marker(out, i..i + 2, st.marker, id);
+            fmt_marker(out, i..i + 2, st.marker);
             scan_styled_body(
                 text,
                 i + 2,
@@ -866,9 +839,8 @@ fn scan_inline(
                 }
                 .over(base),
                 depth,
-                next_id,
             );
-            fmt_marker(out, close..close + 2, st.marker, id);
+            fmt_marker(out, close..close + 2, st.marker);
             i = close + 2;
             continue;
         }
@@ -879,9 +851,7 @@ fn scan_inline(
             && b[i + 1] == b'~'
             && let Some(close) = find2_unescaped(b, i + 2, end, b'~', b'~')
         {
-            let id = *next_id;
-            *next_id += 1;
-            fmt_marker(out, i..i + 2, st.marker, id);
+            fmt_marker(out, i..i + 2, st.marker);
             scan_styled_body(
                 text,
                 i + 2,
@@ -894,9 +864,8 @@ fn scan_inline(
                 }
                 .over(base),
                 depth,
-                next_id,
             );
-            fmt_marker(out, close..close + 2, st.marker, id);
+            fmt_marker(out, close..close + 2, st.marker);
             i = close + 2;
             continue;
         }
@@ -1104,9 +1073,7 @@ fn scan_inline(
             let body = i + gt + 1;
             let close = body + rel;
             let close_len = tag.kind.close().len();
-            let id = *next_id;
-            *next_id += 1;
-            fmt_marker(out, i..body, st.marker, id);
+            fmt_marker(out, i..body, st.marker);
             let style = match tag.kind {
                 StyledKind::Mark => Style {
                     bg: Some(tag.background.map_or(st.mark_bg, hsla_of)),
@@ -1122,8 +1089,8 @@ fn scan_inline(
                     ..Default::default()
                 },
             };
-            scan_styled_body(text, body, close, st, out, style.over(base), depth, next_id);
-            fmt_marker(out, close..close + close_len, st.marker, id);
+            scan_styled_body(text, body, close, st, out, style.over(base), depth);
+            fmt_marker(out, close..close + close_len, st.marker);
             i = close + close_len;
             continue;
         }
@@ -2313,15 +2280,14 @@ mod tests {
     fn selection_reveal_shows_inline_but_not_prefix() {
         let (font, c, st) = (Font::default(), Hsla::default(), test_style());
         // A selected list line: the `- ` prefix stays hidden behind its
-        // painted bullet — and formatting markers stay hidden too now
-        // (always_hide wins over the selection reveal; structural markers
-        // like links still come back).
-        let (disp, _, _) = hidden_runs("- a **b** c", &font, c, &[], None, 0, 2, true, &st);
+        // painted bullet — and formatting markers stay hidden under a
+        // selection (structural markers like links still come back).
+        let (disp, _, _) = hidden_runs("- a **b** c", &font, c, &[], None, 0, 2, true, None, &st);
         assert_eq!(disp, "a b c");
-        let (disp, _, _) = hidden_runs("- [t](u) c", &font, c, &[], None, 0, 2, true, &st);
+        let (disp, _, _) = hidden_runs("- [t](u) c", &font, c, &[], None, 0, 2, true, None, &st);
         assert_eq!(disp, "[t](u) c");
         // Same line unselected: everything hidden.
-        let (disp, _, _) = hidden_runs("- a **b** c", &font, c, &[], None, 0, 2, false, &st);
+        let (disp, _, _) = hidden_runs("- a **b** c", &font, c, &[], None, 0, 2, false, None, &st);
         assert_eq!(disp, "a b c");
     }
 
@@ -2811,7 +2777,7 @@ mod tests {
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        let (disp, ..) = hidden_runs("- ### Notes", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, ..) = hidden_runs("- ### Notes", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "Notes");
     }
 
@@ -2879,22 +2845,105 @@ mod tests {
         let st = test_style();
 
         // "**bold**" → "bold"; display 0 maps to source 2, end (4) to 8.
-        let (disp, _, map) = hidden_runs("**bold**", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, map) = hidden_runs("**bold**", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "bold");
         assert_eq!(map.len(), disp.len() + 1);
         assert_eq!(map[0], 2);
         assert_eq!(map[4], 8);
 
         // "## Hi" → "Hi"; the `## ` prefix is gone, display 0 maps to source 3.
-        let (disp, _, map) = hidden_runs("## Hi", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, map) = hidden_runs("## Hi", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "Hi");
         assert_eq!(map[0], 3);
         assert_eq!(map[2], 5);
 
         // No markers → unchanged, identity map.
-        let (disp, _, map) = hidden_runs("plain text", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, map) = hidden_runs("plain text", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "plain text");
         assert_eq!(map, (0..=10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn caret_at_a_construct_boundary_reveals_it() {
+        let font = gpui::font("Helvetica");
+        let c = hsla(0., 0., 0., 1.);
+        let st = test_style();
+
+        // Both ends belong to the construct (Obsidian's live preview): typing
+        // `**重点**` leaves the caret at 10, on the closing marker, and the
+        // markers stay on screen.
+        for caret in [0, 4, 9, 10] {
+            let (disp, ..) = hidden_runs(
+                "**重点**",
+                &font,
+                c,
+                &[],
+                Some(caret),
+                0,
+                0,
+                false,
+                None,
+                &st,
+            );
+            assert_eq!(disp, "**重点**", "caret {caret}");
+        }
+        // One byte past the construct, in plain text: hidden again.
+        let (disp, ..) = hidden_runs(
+            "**重点** x",
+            &font,
+            c,
+            &[],
+            Some(11),
+            0,
+            0,
+            false,
+            None,
+            &st,
+        );
+        assert_eq!(disp, "重点 x");
+        // A selection on the line does not reveal the formatting markers.
+        let (disp, ..) = hidden_runs("**a** b", &font, c, &[], None, 0, 0, true, None, &st);
+        assert_eq!(disp, "a b");
+    }
+
+    #[test]
+    fn hidden_runs_hides_a_comment_whole() {
+        let font = gpui::font("Helvetica");
+        let c = hsla(0., 0., 0., 1.);
+        let st = test_style();
+
+        // `%%…%%` (markers and body) leaves the space on either side, and the
+        // display still maps back past the comment.
+        let (disp, _, map) = hidden_runs(
+            "a %%b%% c",
+            &font,
+            c,
+            &[],
+            None,
+            0,
+            0,
+            false,
+            Some(2..7),
+            &st,
+        );
+        assert_eq!(disp, "a  c");
+        assert_eq!(map[0], 0);
+        assert_eq!(map[2], 7);
+
+        // A comment covering a construct's bytes wins over the inline styling.
+        let (disp, ..) = hidden_runs(
+            "x %%**y**%% z",
+            &font,
+            c,
+            &[],
+            None,
+            0,
+            0,
+            false,
+            Some(2..11),
+            &st,
+        );
+        assert_eq!(disp, "x  z");
     }
 
     #[test]
@@ -2907,7 +2956,18 @@ mod tests {
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        let (disp, ..) = hidden_runs("![](images/a.png)", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, ..) = hidden_runs(
+            "![](images/a.png)",
+            &font,
+            c,
+            &[],
+            None,
+            0,
+            0,
+            false,
+            None,
+            &st,
+        );
         assert_eq!(disp, "");
 
         // A named alt still shows it, same as a plain link.
@@ -2920,6 +2980,7 @@ mod tests {
             0,
             0,
             false,
+            None,
             &st,
         );
         assert_eq!(disp, "alt");
@@ -2942,6 +3003,7 @@ mod tests {
             0,
             0,
             false,
+            None,
             &st,
         );
         assert_eq!(disp, "bold");
@@ -2958,6 +3020,7 @@ mod tests {
             0,
             0,
             false,
+            None,
             &st,
         );
         assert_eq!(disp, "plain text");
@@ -2976,22 +3039,22 @@ mod tests {
         let st = test_style();
 
         let line = "**bold** *it*";
-        // Formatting markers never reveal — not even under the caret
-        // (Cditor-style; see `formatting_markers_never_reveal`).
-        let (disp, _, _) = hidden_runs(line, &font, c, &[], Some(4), 0, 0, false, &st);
-        assert_eq!(disp, "bold it");
+        // Formatting markers reveal only for the construct under the caret
+        // (Obsidian-style; see `formatting_markers_reveal_under_the_caret`).
+        let (disp, _, _) = hidden_runs(line, &font, c, &[], Some(4), 0, 0, false, None, &st);
+        assert_eq!(disp, "**bold** it");
         // Caret in plain text reveals nothing either.
-        let (disp, _, _) = hidden_runs("a **b**", &font, c, &[], Some(0), 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs("a **b**", &font, c, &[], Some(0), 0, 0, false, None, &st);
         assert_eq!(disp, "a b");
         // No caret on the line → fully hidden (W6).
-        let (disp, _, _) = hidden_runs(line, &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs(line, &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "bold it");
         // STRUCTURAL constructs keep the per-construct caret reveal: the
         // caret inside a link shows its brackets/URL; outside, hidden.
         let link = "a [t](u) b";
-        let (disp, _, _) = hidden_runs(link, &font, c, &[], Some(3), 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs(link, &font, c, &[], Some(3), 0, 0, false, None, &st);
         assert_eq!(disp, "a [t](u) b");
-        let (disp, _, _) = hidden_runs(link, &font, c, &[], Some(0), 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs(link, &font, c, &[], Some(0), 0, 0, false, None, &st);
         assert_eq!(disp, "a t b");
     }
 
@@ -3017,13 +3080,13 @@ mod tests {
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        let (disp, _, map) = hidden_runs("> a **b**", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, map) = hidden_runs("> a **b**", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "a b"); // "> " + "**" hidden
         assert_eq!(map[0], 2); // display 0 ('a') ← source 2
 
         // With the prefix revealed (caret on the line) the `> ` shows even when
         // the caret isn't in it; inline markers still hide unless under the caret.
-        let (disp, _, _) = hidden_runs("> a **b**", &font, c, &[], Some(3), 2, 0, false, &st);
+        let (disp, _, _) = hidden_runs("> a **b**", &font, c, &[], Some(3), 2, 0, false, None, &st);
         assert_eq!(disp, "> a b");
     }
 
@@ -3085,13 +3148,13 @@ mod tests {
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        let (disp, _, _) = hidden_runs(r"\*text\*", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs(r"\*text\*", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "*text*");
         // `\\` shows a single backslash.
-        let (disp, _, _) = hidden_runs(r"a \\ b", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs(r"a \\ b", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, r"a \ b");
         // CommonMark: \**bold** = literal *, italic "bold", literal *.
-        let (disp, _, _) = hidden_runs(r"\**bold**", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, _) = hidden_runs(r"\**bold**", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "*bold*");
     }
 
@@ -3120,37 +3183,30 @@ mod tests {
         // Display hides every marker, nested included.
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
-        let (disp, _, _) = hidden_runs("**bold *it* bold**", &font, c, &[], None, 0, 0, false, &st);
-        assert_eq!(disp, "bold it bold");
-        // Pairing survives nesting: two pairs, outer first.
-        let pairs = fmt_marker_pairs("**bold *it* bold**", &st);
-        assert_eq!(pairs, vec![(0..2, 16..18), (7..8, 10..11)]);
-    }
-
-    #[test]
-    fn fmt_marker_pairs_stay_per_construct() {
-        let st = test_style();
-        // Adjacent constructs pair up separately — a delete between them must
-        // never fuse one's closer with the other's opener.
-        assert_eq!(
-            fmt_marker_pairs("**a**~~b~~", &st),
-            vec![(0..2, 3..5), (5..7, 8..10)]
+        let (disp, _, _) = hidden_runs(
+            "**bold *it* bold**",
+            &font,
+            c,
+            &[],
+            None,
+            0,
+            0,
+            false,
+            None,
+            &st,
         );
-        // An empty pair (post-delete state) is still a pair.
-        assert_eq!(fmt_marker_pairs("****", &st), vec![(0..2, 2..4)]);
-        // Structural markers (links) aren't formatting pairs.
-        assert_eq!(fmt_marker_pairs("[t](u)", &st), vec![]);
-        assert_eq!(fmt_marker_pairs("<u>x</u>", &st), vec![(0..3, 4..8)]);
+        assert_eq!(disp, "bold it bold");
     }
 
     #[test]
-    fn formatting_markers_never_reveal() {
-        // Cditor-style: even with the caret INSIDE the construct, formatting
-        // markers stay hidden (the styling is the feedback; toggles edit it).
+    fn formatting_markers_reveal_under_the_caret() {
+        // Obsidian-style: a formatting construct shows its markers while the
+        // caret is INSIDE it, and hides them again once it leaves. The styling
+        // is still what you see at rest; the raw text is what you arrow into.
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        for (line, disp) in [
+        for (line, bare) in [
             ("**bold** x", "bold x"),
             ("*it* x", "it x"),
             ("~~s~~ x", "s x"),
@@ -3158,13 +3214,15 @@ mod tests {
             ("<u>u</u> x", "u x"),
             ("<mark>m</mark> x", "m x"),
         ] {
-            let caret_inside = Some(3.min(line.len() - 1));
-            let (d, _, _) = hidden_runs(line, &font, c, &[], caret_inside, 0, 0, false, &st);
-            assert_eq!(d, disp, "{line:?}");
+            let caret_inside = Some(line.len() / 2);
+            let (d, _, _) = hidden_runs(line, &font, c, &[], caret_inside, 0, 0, false, None, &st);
+            assert_eq!(d, line, "{line:?} reveals inside");
+            let (d, _, _) = hidden_runs(line, &font, c, &[], None, 0, 0, false, None, &st);
+            assert_eq!(d, bare, "{line:?} hides at rest");
         }
         // Structural constructs keep the caret reveal: a wiki link's brackets
         // show while the caret is inside it.
-        let (d, _, _) = hidden_runs("[[Page]] x", &font, c, &[], Some(4), 0, 0, false, &st);
+        let (d, _, _) = hidden_runs("[[Page]] x", &font, c, &[], Some(4), 0, 0, false, None, &st);
         assert_eq!(d, "[[Page]] x");
     }
 
@@ -3218,7 +3276,7 @@ mod tests {
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        let (disp, _, map) = hidden_runs("  - hi", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, map) = hidden_runs("  - hi", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "hi");
         assert_eq!(map[0], 4); // display 0 ('h') ← source 4
     }
@@ -3236,7 +3294,7 @@ mod tests {
         let font = gpui::font("Helvetica");
         let c = hsla(0., 0., 0., 1.);
         let st = test_style();
-        let (disp, _, map) = hidden_runs("- [x] go", &font, c, &[], None, 0, 0, false, &st);
+        let (disp, _, map) = hidden_runs("- [x] go", &font, c, &[], None, 0, 0, false, None, &st);
         assert_eq!(disp, "go");
         assert_eq!(map[0], 6); // display 0 ('g') ← source 6
     }
